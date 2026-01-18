@@ -19,7 +19,7 @@ use embassy_time::Instant;
 use embassy_time::Timer;
 use embedded_io_async::Write as EmbeddedWrite;
 #[cfg(feature = "tls")]
-use embedded_tls::{Aes128GcmSha256, NoVerify, TlsConfig, TlsConnection, TlsContext};
+use embedded_tls::{Aes128GcmSha256, TlsConfig, TlsConnection, TlsContext, UnsecureProvider};
 use heapless::Vec;
 #[cfg(feature = "tls")]
 use rand_chacha::ChaCha8Rng;
@@ -265,12 +265,13 @@ impl<
         let mut read_record_buffer = [0; TLS_READ];
         let mut write_record_buffer = [0; TLS_WRITE];
 
-        let tls_config: TlsConfig<'_, Aes128GcmSha256> = TlsConfig::new().with_server_name(host);
-        let mut tls = TlsConnection::new(socket, &mut read_record_buffer, &mut write_record_buffer);
-        let mut rng = ChaCha8Rng::from_seed(timeseed());
+        let tls_config: TlsConfig<'_> = TlsConfig::new().with_server_name(host);
+        let mut tls: TlsConnection<_, Aes128GcmSha256> =
+            TlsConnection::new(socket, &mut read_record_buffer, &mut write_record_buffer);
+        let rng = ChaCha8Rng::from_seed(timeseed());
+        let provider = UnsecureProvider::new::<Aes128GcmSha256>(rng);
 
-        tls.open::<_, NoVerify>(TlsContext::new(&tls_config, &mut rng))
-            .await?;
+        tls.open(TlsContext::new(&tls_config, provider)).await?;
 
         let http_request = Self::build_http_request(method, host, path, headers, body)?;
 
