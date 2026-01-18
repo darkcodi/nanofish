@@ -197,6 +197,7 @@ impl<
 
         let host = url_parts[0];
         let path = &host_port[host.len()..];
+        let path = if path.is_empty() { "/" } else { path };
 
         let (host, port) = if let Some(colon_pos) = host.rfind(':') {
             if let Ok(port) = host[colon_pos + 1..].parse::<u16>() {
