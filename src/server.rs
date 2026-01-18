@@ -109,94 +109,129 @@ impl<
                 continue;
             }
 
-            let n = match with_timeout(
-                Duration::from_secs(self.timeouts.read_timeout),
-                socket.read(&mut buf),
-            )
-            .await
-            {
-                Ok(Ok(0)) => {
-                    // Connection closed
-                    continue;
-                }
-                Ok(Ok(n)) => n,
-                Ok(Err(e)) => {
-                    defmt::warn!("Read error: {:?}", e);
-                    continue;
-                }
-                Err(_) => {
-                    defmt::warn!("Socket read timeout");
-                    continue;
-                }
-            };
-
-            // Parse the request
-            match self.handle_connection(&buf[..n], &mut handler).await {
-                Ok(response_bytes) => {
-                    if let Err(e) = socket.write_all(&response_bytes).await {
-                        defmt::warn!("Failed to write response: {:?}", e);
+            loop {
+                let n = match with_timeout(
+                    Duration::from_secs(self.timeouts.read_timeout),
+                    socket.read(&mut buf),
+                )
+                .await
+                {
+                    Ok(Ok(0)) => {
+                        // Connection closed by peer
+                        break;
                     }
+                    Ok(Ok(n)) => n,
+                    Ok(Err(e)) => {
+                        defmt::warn!("Read error: {:?}", e);
+                        break;
+                    }
+                    Err(_) => {
+                        defmt::warn!("Socket read timeout");
+                        break;
+                    }
+                };
+
+                let should_close = match handle_connection::<MAX_RESPONSE_SIZE, _>(
+                    self.timeouts,
+                    &buf[..n],
+                    &mut handler,
+                )
+                .await
+                {
+                    Ok((response_bytes, should_close)) => {
+                        if let Err(e) = socket.write_all(&response_bytes).await {
+                            defmt::warn!("Failed to write response: {:?}", e);
+                            true
+                        } else {
+                            should_close
+                        }
+                    }
+                    Err(e) => {
+                        defmt::error!("Error handling request: {:?}", e);
+                        let error_response = b"HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: 21\r\n\r\nInternal Server Error";
+                        let _ = socket.write_all(error_response).await;
+                        true
+                    }
+                };
+
+                if let Err(e) = socket.flush().await {
+                    defmt::warn!("Failed to flush response: {:?}", e);
                 }
-                Err(e) => {
-                    defmt::error!("Error handling request: {:?}", e);
-                    // Send a 500 error response
-                    let error_response = b"HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: 21\r\n\r\nInternal Server Error";
-                    let _ = socket.write_all(error_response).await;
+
+                if should_close {
+                    break;
                 }
             }
 
-            if let Err(e) = socket.flush().await {
-                defmt::warn!("Failed to flush response: {:?}", e);
-            }
             socket.close();
         }
     }
 
-    async fn handle_connection<H>(
-        &mut self,
-        buffer: &[u8],
-        handler: &mut H,
-    ) -> Result<Vec<u8, MAX_RESPONSE_SIZE>, Error>
-    where
-        H: HttpHandler,
+}
+
+async fn handle_connection<const MAX_RESPONSE_SIZE: usize, H: HttpHandler>(
+    timeouts: ServerTimeouts,
+    buffer: &[u8],
+    handler: &mut H,
+) -> Result<(Vec<u8, MAX_RESPONSE_SIZE>, bool), Error> {
+    let request = HttpRequest::try_from(buffer)?;
+    let should_close = should_close_connection(&request);
+
+    let response = match with_timeout(
+        Duration::from_secs(timeouts.handler_timeout),
+        handler.handle_request(&request),
+    )
+    .await
     {
-        // Parse the request
-        let request = HttpRequest::try_from(buffer)?;
+        Ok(Ok(response)) => response,
+        Ok(Err(e)) => {
+            defmt::warn!("Handler error: {:?}", e);
+            let mut headers = Vec::new();
+            let _ = headers.push(HttpHeader::new("Content-Type", "text/plain"));
+            let error_response = HttpResponse {
+                status_code: StatusCode::InternalServerError,
+                headers,
+                body: ResponseBody::Text("Internal Server Error"),
+            };
+            return Ok((error_response.build_bytes::<MAX_RESPONSE_SIZE>(), true));
+        }
+        Err(_) => {
+            defmt::warn!("Request handling timed out");
+            let mut headers = Vec::new();
+            let _ = headers.push(HttpHeader::new("Content-Type", "text/plain"));
+            let timeout_response = HttpResponse {
+                status_code: StatusCode::RequestTimeout,
+                headers,
+                body: ResponseBody::Text("Request Timeout"),
+            };
+            return Ok((timeout_response.build_bytes::<MAX_RESPONSE_SIZE>(), true));
+        }
+    };
 
-        // Handle the request
-        let response = match with_timeout(
-            Duration::from_secs(self.timeouts.handler_timeout),
-            handler.handle_request(&request),
-        )
-        .await
-        {
-            Ok(Ok(response)) => response,
-            Ok(Err(e)) => {
-                defmt::warn!("Handler error: {:?}", e);
-                let mut headers = Vec::new();
-                let _ = headers.push(HttpHeader::new("Content-Type", "text/plain"));
-                let error_response = HttpResponse {
-                    status_code: StatusCode::InternalServerError,
-                    headers,
-                    body: ResponseBody::Text("Internal Server Error"),
-                };
-                return Ok(error_response.build_bytes::<MAX_RESPONSE_SIZE>());
-            }
-            Err(_) => {
-                defmt::warn!("Request handling timed out");
-                let mut headers = Vec::new();
-                let _ = headers.push(HttpHeader::new("Content-Type", "text/plain"));
-                let timeout_response = HttpResponse {
-                    status_code: StatusCode::RequestTimeout,
-                    headers,
-                    body: ResponseBody::Text("Request Timeout"),
-                };
-                return Ok(timeout_response.build_bytes::<MAX_RESPONSE_SIZE>());
-            }
-        };
+    Ok((response.build_bytes::<MAX_RESPONSE_SIZE>(), should_close))
+}
 
-        Ok(response.build_bytes::<MAX_RESPONSE_SIZE>())
+fn should_close_connection(request: &HttpRequest<'_>) -> bool {
+    let mut connection_header = None;
+    for header in request.headers.iter() {
+        if header.name.eq_ignore_ascii_case("Connection") {
+            connection_header = Some(header.value);
+            break;
+        }
     }
+
+    let is_http_11 = request.version.eq_ignore_ascii_case("HTTP/1.1");
+    if let Some(value) = connection_header {
+        if value.eq_ignore_ascii_case("close") {
+            return true;
+        }
+        if value.eq_ignore_ascii_case("keep-alive") {
+            return false;
+        }
+    }
+
+    // HTTP/1.1 defaults to keep-alive; HTTP/1.0 and others default to close.
+    !is_http_11
 }
 
 /// Type alias for `HttpServer` with default buffer sizes (4KB each)
