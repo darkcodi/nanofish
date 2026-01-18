@@ -145,6 +145,9 @@ impl<
                 }
             }
 
+            if let Err(e) = socket.flush().await {
+                defmt::warn!("Failed to flush response: {:?}", e);
+            }
             socket.close();
         }
     }
