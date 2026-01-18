@@ -809,25 +809,26 @@ impl<
 
     /// Check if HTTP response is complete
     fn is_response_complete(data: &[u8]) -> bool {
-        let response_str = core::str::from_utf8(data).unwrap_or_default();
+        let headers_end = match data.windows(4).position(|w| w == b"\r\n\r\n") {
+            Some(pos) => pos + 4,
+            None => return false,
+        };
 
-        if !response_str.contains("\r\n\r\n") {
-            return false;
-        }
+        let headers_bytes = &data[..headers_end];
+        let headers_str = match core::str::from_utf8(headers_bytes) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
 
         // Check for Content-Length header to determine if we have the full body
-        if let Some(content_length_pos) = response_str.find("Content-Length:") {
-            let content_length_end = response_str[content_length_pos..]
-                .find("\r\n")
-                .unwrap_or_default()
-                + content_length_pos;
-            let content_length_str =
-                &response_str[content_length_pos + 15..content_length_end].trim();
-
-            if let Ok(content_length) = content_length_str.parse::<usize>() {
-                let headers_end = response_str.find("\r\n\r\n").unwrap_or_default() + 4;
-                let body_received = data.len().saturating_sub(headers_end);
-                return body_received >= content_length;
+        for line in headers_str.lines() {
+            if let Some((name, value)) = line.split_once(':') {
+                if name.trim().eq_ignore_ascii_case("Content-Length") {
+                    if let Ok(content_length) = value.trim().parse::<usize>() {
+                        let body_received = data.len().saturating_sub(headers_end);
+                        return body_received >= content_length;
+                    }
+                }
             }
         }
 
@@ -864,6 +865,18 @@ mod tests {
     fn test_is_response_complete_incomplete() {
         let data = b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort";
         assert!(!DefaultHttpClient::is_response_complete(data));
+    }
+
+    #[test]
+    fn test_is_response_complete_case_insensitive_content_length() {
+        let data = b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\nping";
+        assert!(DefaultHttpClient::is_response_complete(data));
+    }
+
+    #[test]
+    fn test_is_response_complete_binary_body() {
+        let data = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n\xff\xfe\xfd";
+        assert!(DefaultHttpClient::is_response_complete(data));
     }
 
     #[test]
