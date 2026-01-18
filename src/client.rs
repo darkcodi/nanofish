@@ -652,14 +652,21 @@ impl<
 
     /// Parse HTTP response from raw data with zero-copy handling
     fn parse_http_response_zero_copy(data: &[u8]) -> Result<HttpResponse<'_>, Error> {
-        let response_str = core::str::from_utf8(data)
+        let headers_end = data
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .ok_or(Error::InvalidResponse("Invalid HTTP response format"))?
+            + 4;
+
+        let headers_bytes = &data[..headers_end];
+        let headers_str = core::str::from_utf8(headers_bytes)
             .map_err(|_| Error::InvalidResponse("Invalid HTTP response encoding"))?;
 
-        let status_line_end = response_str
+        let status_line_end = headers_str
             .find("\r\n")
             .ok_or(Error::InvalidResponse("Invalid HTTP response format"))?;
 
-        let status_line = &response_str[..status_line_end];
+        let status_line = &headers_str[..status_line_end];
         let status_code_str = status_line
             .split_whitespace()
             .nth(1)
@@ -667,12 +674,7 @@ impl<
 
         let status_code: StatusCode = status_code_str.try_into()?;
 
-        let headers_end = response_str
-            .find("\r\n\r\n")
-            .ok_or(Error::InvalidResponse("Invalid HTTP response format"))?
-            + 4;
-
-        let headers_section = &response_str[status_line_end + 2..headers_end - 4];
+        let headers_section = &headers_str[status_line_end + 2..headers_end - 4];
         let mut headers = Vec::<HttpHeader<'_>, MAX_HEADERS>::new();
 
         for header_line in headers_section.split("\r\n") {
@@ -878,6 +880,16 @@ mod tests {
     fn test_is_response_complete_binary_body() {
         let data = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n\xff\xfe\xfd";
         assert!(DefaultHttpClient::is_response_complete(data));
+    }
+
+    #[test]
+    fn test_parse_http_response_zero_copy_binary_body() {
+        let data = b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 3\r\n\r\n\xff\xfe\xfd";
+        let response = DefaultHttpClient::parse_http_response_zero_copy(data).unwrap();
+        match response.body {
+            ResponseBody::Binary(bytes) => assert_eq!(bytes, b"\xff\xfe\xfd"),
+            _ => panic!("Expected binary body"),
+        }
     }
 
     #[test]
