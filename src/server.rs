@@ -184,7 +184,7 @@ impl<
                 let mut headers = Vec::new();
                 let _ = headers.push(HttpHeader::new("Content-Type", "text/plain"));
                 let timeout_response = HttpResponse {
-                    status_code: StatusCode::BadRequest,
+                    status_code: StatusCode::RequestTimeout,
                     headers,
                     body: ResponseBody::Text("Request Timeout"),
                 };
